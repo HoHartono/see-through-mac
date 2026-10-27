@@ -228,7 +228,12 @@ class TransparentVAEDecoder(torch.nn.Module):
             result += [eps]
             break
 
+        if len(result) == 1:
+            return result[0]
         result = torch.stack(result, dim=0)
+        if result.device.type == 'mps':
+            # MPS sort only supports up to 4 dims; this stack is 5-D
+            return torch.median(result.float().cpu(), dim=0).values.to(result.device, result.dtype)
         median = torch.median(result, dim=0).values
         return median
 

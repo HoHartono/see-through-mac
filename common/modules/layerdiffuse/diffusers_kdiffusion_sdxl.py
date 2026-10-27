@@ -271,7 +271,9 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
             self.text_encoder = self.text_encoder_2 = torch.nn.Identity()
             gc.collect()
             torch.cuda.empty_cache()
-        
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+
     
     def denoise_func(self, latents, add_text_embeds, add_time_ids, prompt_embeds, c_concat, num_inference_steps=50):
 
@@ -476,6 +478,10 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
             return latents
 
         latents = latents.to(dtype=self.trans_vae.dtype, device=self.trans_vae.device) / self.vae.config.scaling_factor
+        # release the denoising loop's cached buffers before decoding; on a 24GB Mac they push the decode into swap
+        gc.collect()
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
 
         vis_list = []
         res_list = []

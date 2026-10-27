@@ -25,6 +25,14 @@ VALID_BODY_PARTS_V2 = [
 ]
 
 
+DEVICE = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+
+# v3 layer tags; callers can shrink these to skip parts a character doesn't have (fewer layers = less memory)
+BODY_TAGS_V3 = ['front hair', 'back hair', 'head', 'neck', 'neckwear', 'topwear', 'handwear', 'bottomwear', 'legwear', 'footwear', 'tail', 'wings', 'objects']
+HEAD_TAGS_V3 = ['headwear', 'face', 'irides', 'eyebrow', 'eyewhite', 'eyelash', 'eyewear', 'ears', 'earwear', 'nose', 'mouth']
+# 'both' (original behaviour), 'body' (body layers only) or 'head' (head layers from a saved head.png)
+LAYERDIFF_STAGE = 'both'
+
 layerdiff_pipeline: KDiffusionStableDiffusionXLPipeline = None
 def apply_layerdiff(
     imgp: str, pretrained: str, num_inference_steps=30, seed=0, save_dir='workspace/layerdiff_output', target_tag_list=VALID_BODY_PARTS_V2, 
@@ -32,16 +40,17 @@ def apply_layerdiff(
     
     global layerdiff_pipeline
     if layerdiff_pipeline is None:
-        trans_vae = TransparentVAE.from_pretrained(pretrained, subfolder='trans_vae')
+        # load straight into bf16: fp32 loading doubles peak memory, which swaps on a 24GB Mac
+        trans_vae = TransparentVAE.from_pretrained(pretrained, subfolder='trans_vae', torch_dtype=torch.bfloat16)
         if unet_ckpt is None:
-            unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')
+            unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet', torch_dtype=torch.bfloat16)
         else:
             print(f'load unet from {unet_ckpt}')
-            unet = UNetFrameConditionModel.from_pretrained(unet_ckpt)
+            unet = UNetFrameConditionModel.from_pretrained(unet_ckpt, torch_dtype=torch.bfloat16)
         layerdiff_pipeline = KDiffusionStableDiffusionXLPipeline.from_pretrained(
             pretrained,
             trans_vae=trans_vae, unet=unet,
-            scheduler=None
+            scheduler=None, torch_dtype=torch.bfloat16
         )
 
         if vae_ckpt is not None:
@@ -62,13 +71,13 @@ def apply_layerdiff(
                 layerdiff_pipeline.trans_vae.decoder.load_state_dict(td_sd)
                 print(f'load vae from {vae_ckpt}')
 
-        layerdiff_pipeline.vae.to(dtype=torch.bfloat16, device='cuda')
-        layerdiff_pipeline.trans_vae.to(dtype=torch.bfloat16, device='cuda')
-        layerdiff_pipeline.unet.to(dtype=torch.bfloat16, device='cuda')
-        layerdiff_pipeline.text_encoder.to(dtype=torch.bfloat16, device='cuda')
-        layerdiff_pipeline.text_encoder_2.to(dtype=torch.bfloat16, device='cuda')
+        layerdiff_pipeline.vae.to(dtype=torch.bfloat16, device=DEVICE)
+        layerdiff_pipeline.trans_vae.to(dtype=torch.bfloat16, device=DEVICE)
+        layerdiff_pipeline.unet.to(dtype=torch.bfloat16, device=DEVICE)
+        layerdiff_pipeline.text_encoder.to(dtype=torch.bfloat16, device=DEVICE)
+        layerdiff_pipeline.text_encoder_2.to(dtype=torch.bfloat16, device=DEVICE)
         if group_offload:
-            layerdiff_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
+            layerdiff_pipeline.enable_group_offload(DEVICE, num_blocks_per_group=1)
 
     pipeline = layerdiff_pipeline
     if cache_tag_embeds:
@@ -121,26 +130,35 @@ def apply_layerdiff(
 
             return img[y1: y2, x1: x2], (x1, y1, x2, y2)
 
-        body_tag_list = ['front hair', 'back hair', 'head', 'neck', 'neckwear', 'topwear', 'handwear', 'bottomwear', 'legwear', 'footwear', 'tail', 'wings', 'objects']
-        pipeline_output = pipeline(
-            strength=1.0,
-            num_inference_steps=num_inference_steps,
-            batch_size=1,
-            generator=rng,
-            guidance_scale=1.0,
-            prompt=body_tag_list,
-            negative_prompt='',
-            fullpage=fullpage,
-            group_index=0
-        )
-        images = pipeline_output.images
-        for rst, tag in zip(pipeline_output.images, body_tag_list):
-            savename = osp.join(saved, f'{tag}.png')
-            Image.fromarray(rst).save(savename)
-        head_img = images[2]
-        # head_img = np.array(Image.open(osp.join(saved, 'head.png')))
+        if LAYERDIFF_STAGE != 'head':
+            body_tag_list = BODY_TAGS_V3
+            pipeline_output = pipeline(
+                strength=1.0,
+                num_inference_steps=num_inference_steps,
+                batch_size=1,
+                generator=rng,
+                guidance_scale=1.0,
+                prompt=body_tag_list,
+                negative_prompt='',
+                fullpage=fullpage,
+                group_index=0
+            )
+            images = pipeline_output.images
+            for rst, tag in zip(pipeline_output.images, body_tag_list):
+                savename = osp.join(saved, f'{tag}.png')
+                Image.fromarray(rst).save(savename)
+            head_img = images[2]
+            del pipeline_output, images
+            gc.collect()
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+            if LAYERDIFF_STAGE == 'body':
+                return
+        else:
+            # head pass in a fresh process: on a 24GB Mac the body pass leaves too much memory behind
+            head_img = np.array(Image.open(osp.join(saved, 'head.png')))
 
-        head_tag_list = ['headwear', 'face', 'irides', 'eyebrow', 'eyewhite', 'eyelash', 'eyewear', 'ears', 'earwear', 'nose', 'mouth']
+        head_tag_list = HEAD_TAGS_V3
         hx0, hy0, hw, hh = cv2.boundingRect(cv2.findNonZero((head_img[..., -1] > 15).astype(np.uint8)))
         
         hx = int(hx0 * scale) - pad_pos[0]
@@ -190,12 +208,12 @@ def apply_marigold(srcp, pretrained: str, num_inference_steps=-1, seed=0, save_d
     resolution=768, normalize_depth=False, disable_progressbar=False, cache_tag_embeds=True, group_offload=False):
     global marigold_pipeline
     if marigold_pipeline is None:
-        unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')
-        marigold_pipeline = MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet)
-        marigold_pipeline.to(device='cuda', dtype=torch.bfloat16)
+        unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet', torch_dtype=torch.bfloat16)
+        marigold_pipeline = MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet, torch_dtype=torch.bfloat16)
+        marigold_pipeline.to(device=DEVICE, dtype=torch.bfloat16)
 
         if group_offload:
-            marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
+            marigold_pipeline.enable_group_offload(DEVICE, num_blocks_per_group=1)
 
     pipe = marigold_pipeline
 
