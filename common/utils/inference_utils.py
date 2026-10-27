@@ -10,6 +10,8 @@ from utils.cv import center_square_pad_resize, img_alpha_blending, smart_resize,
 from utils.torch_utils import seed_everything
 from utils.io_utils import json2dict, dict2json, load_parts, save_tmp_img, load_part, save_psd
 from utils.torchcv import cluster_inpaint_part
+from utils import mps_lowmem
+from utils.mps_lowmem import MemPhase
 
 from psd_tools import PSDImage
 from safetensors.torch import load_file
@@ -26,6 +28,8 @@ VALID_BODY_PARTS_V2 = [
 
 
 DEVICE = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+if DEVICE == 'mps':
+    mps_lowmem.install()
 
 # v3 layer tags; callers can shrink these to skip parts a character doesn't have (fewer layers = less memory)
 BODY_TAGS_V3 = ['front hair', 'back hair', 'head', 'neck', 'neckwear', 'topwear', 'handwear', 'bottomwear', 'legwear', 'footwear', 'tail', 'wings', 'objects']
@@ -40,6 +44,7 @@ def apply_layerdiff(
     
     global layerdiff_pipeline
     if layerdiff_pipeline is None:
+        load_phase = MemPhase('load layerdiff').__enter__()
         # load straight into bf16: fp32 loading doubles peak memory, which swaps on a 24GB Mac
         trans_vae = TransparentVAE.from_pretrained(pretrained, subfolder='trans_vae', torch_dtype=torch.bfloat16)
         if unet_ckpt is None:
@@ -78,10 +83,12 @@ def apply_layerdiff(
         layerdiff_pipeline.text_encoder_2.to(dtype=torch.bfloat16, device=DEVICE)
         if group_offload:
             layerdiff_pipeline.enable_group_offload(DEVICE, num_blocks_per_group=1)
+        load_phase.__exit__(None, None, None)
 
     pipeline = layerdiff_pipeline
     if cache_tag_embeds:
-        pipeline.cache_tag_embeds()
+        with MemPhase('text embeddings'):
+            pipeline.cache_tag_embeds()
     pipeline.set_progress_bar_config(disable=disable_progressbar)
 
     saved = osp.join(save_dir, osp.splitext(osp.basename(imgp))[0])
@@ -132,17 +139,18 @@ def apply_layerdiff(
 
         if LAYERDIFF_STAGE != 'head':
             body_tag_list = BODY_TAGS_V3
-            pipeline_output = pipeline(
-                strength=1.0,
-                num_inference_steps=num_inference_steps,
-                batch_size=1,
-                generator=rng,
-                guidance_scale=1.0,
-                prompt=body_tag_list,
-                negative_prompt='',
-                fullpage=fullpage,
-                group_index=0
-            )
+            with MemPhase(f'body layers @ {resolution}px'):
+                pipeline_output = pipeline(
+                    strength=1.0,
+                    num_inference_steps=num_inference_steps,
+                    batch_size=1,
+                    generator=rng,
+                    guidance_scale=1.0,
+                    prompt=body_tag_list,
+                    negative_prompt='',
+                    fullpage=fullpage,
+                    group_index=0
+                )
             images = pipeline_output.images
             for rst, tag in zip(pipeline_output.images, body_tag_list):
                 savename = osp.join(saved, f'{tag}.png')
@@ -173,17 +181,18 @@ def apply_layerdiff(
 
         Image.fromarray(input_head).save(osp.join(saved, 'src_head.png'))
 
-        pipeline_output = pipeline(
-            strength=1.0,
-            num_inference_steps=num_inference_steps,
-            batch_size=1,
-            generator=rng,
-            guidance_scale=1.0,
-            prompt=head_tag_list,
-            negative_prompt='',
-            fullpage=input_head,
-            group_index=1
-        )
+        with MemPhase(f'head layers @ {resolution}px'):
+            pipeline_output = pipeline(
+                strength=1.0,
+                num_inference_steps=num_inference_steps,
+                batch_size=1,
+                generator=rng,
+                guidance_scale=1.0,
+                prompt=head_tag_list,
+                negative_prompt='',
+                fullpage=input_head,
+                group_index=1
+            )
         canvas = np.zeros((resolution, resolution, 4), dtype=np.uint8)
 
         py1, py2, px1, px2 = (np.array([pad_pos[1], pad_pos[1] + ih, pad_pos[0], pad_pos[0] + iw]) / scale).astype(np.int64)
@@ -208,9 +217,10 @@ def apply_marigold(srcp, pretrained: str, num_inference_steps=-1, seed=0, save_d
     resolution=768, normalize_depth=False, disable_progressbar=False, cache_tag_embeds=True, group_offload=False):
     global marigold_pipeline
     if marigold_pipeline is None:
-        unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet', torch_dtype=torch.bfloat16)
-        marigold_pipeline = MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet, torch_dtype=torch.bfloat16)
-        marigold_pipeline.to(device=DEVICE, dtype=torch.bfloat16)
+        with MemPhase('load marigold'):
+            unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet', torch_dtype=torch.bfloat16)
+            marigold_pipeline = MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet, torch_dtype=torch.bfloat16)
+            marigold_pipeline.to(device=DEVICE, dtype=torch.bfloat16)
 
         if group_offload:
             marigold_pipeline.enable_group_offload(DEVICE, num_blocks_per_group=1)
@@ -280,12 +290,13 @@ def apply_marigold(srcp, pretrained: str, num_inference_steps=-1, seed=0, save_d
         img_list_input = [smart_resize(img, resolution) for img in img_list]
 
     seed_everything(seed)
-    pipe_out = pipe(
-        # tensor2img(img, 'pil', denormalize=True, mean=127.5, std=127.5),
-        color_map=None,
-        img_list = img_list_input,
-        denoising_steps=num_inference_steps
-    )
+    with MemPhase(f'depth @ {resolution}'):
+        pipe_out = pipe(
+            # tensor2img(img, 'pil', denormalize=True, mean=127.5, std=127.5),
+            color_map=None,
+            img_list = img_list_input,
+            denoising_steps=num_inference_steps
+        )
     depth_pred: np.ndarray = pipe_out.depth_tensor
     
     depth_pred = depth_pred.to(device='cpu', dtype=torch.float32).numpy()
