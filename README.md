@@ -1,3 +1,57 @@
+> ## 🍎 See-through for Apple Silicon Macs (`mac` branch)
+>
+> This fork of [shitagaki-lab/see-through](https://github.com/shitagaki-lab/see-through) runs See-through on
+> Apple Silicon Macs (PyTorch MPS) within 24 GB of unified memory, without writing GBs of swap to the SSD.
+> **The output is unchanged:** a full run at 640 px matches the output from before these memory changes (the
+> first Mac commit, running each pass in its own process) pixel for pixel in all 50 layer and depth files.
+> `main` mirrors upstream; the Mac changes are commits on [`mac`](https://github.com/HoHartono/see-through-mac/tree/mac).
+> All credit for the method and models goes to the original authors (paper and README below).
+>
+> ### What changed (Mac only, NVIDIA/CUDA runs as before)
+>
+> | Change | Why |
+> |---|---|
+> | Use `mps` instead of hardcoded `cuda`; MPS fixes (5-D median on CPU) | Runs on a Mac at all |
+> | Attention, GroupNorm and feed-forward run in pieces of ≤512 MB | MPS builds the whole attention matrix in fp32 (21 GB for one layer at 1280 px). Splits follow batch/heads/groups/tokens, so results are bit-identical |
+> | Weights load one tensor at a time with `F_NOCACHE`, straight to the GPU, in bf16 | `from_pretrained` + `.to('mps')` holds two copies in the same unified memory, and reading the 8 GB file also fills the file cache |
+> | The 24 fixed prompt embeddings are computed once and saved (`tag_embeds_v3.safetensors` next to the model) | The two CLIP text encoders (1.6 GB) are never loaded again; same code and batches, identical values |
+> | Before loading: wait for memory macOS can give without swapping, then free file cache in 512 MB steps | psutil's "available" counts other apps' idle memory, which macOS can only free by swapping |
+> | `PYTORCH_MPS_LOW_WATERMARK_RATIO=0.6` (soft limit only) | By default MPS never tidies its cache on a 24 GB Mac (16.6 GB held for 9.5 GB used) |
+> | `inference_psd.py`: LayerDiff is freed before Marigold loads; the head pass restarts from the seed | Models never sit in memory together; a one-process run gives the same layers as running each pass on its own |
+> | Swap guard (`--swap_limit_mb`, default 1500) | Stops a run if swap keeps growing, so it can't wear the SSD |
+> | Memory report per phase (`[mem] ... lowest free, swap grew, disk writes`) | See which step needs memory |
+>
+> ### Usage on a Mac
+>
+> ```bash
+> PYTHONPATH=common python inference/scripts/inference_psd.py \
+>   --srcp character.png --save_to_psd \
+>   --resolution 640 --resolution_depth 320 \
+>   --repo_id_layerdiff layerdifforg/seethroughv0.0.2_layerdiff3d \
+>   --repo_id_depth 24yearsold/seethroughv0.0.1_marigold   # or local model folders
+> ```
+>
+> Install PyTorch's standard macOS wheel (no CUDA index URL) and `requirements.txt`. Tested on an M5 MacBook with
+> 24 GB, macOS 27, Python 3.13, torch 2.12.1, diffusers 0.42.0; a clean install from this README has not been tested.
+>
+> | Setting | Default | Meaning |
+> |---|---|---|
+> | `--swap_limit_mb` | 1500 | stop when swap grows by more than this (0: off) |
+> | `ST_CHUNK_MB` | 512 | piece size for the chunked operations |
+> | `ST_LOWMEM=0` | on | turn the chunking off (to compare outputs) |
+> | `PYTORCH_MPS_LOW_WATERMARK_RATIO` | 0.6 | when MPS starts freeing its cache; set your own to override |
+>
+> ### Measured (M5, 24 GB, 640 px layers / 320 px depth, one character)
+>
+> | | Before | Now |
+> |---|---|---|
+> | Swap written per run | 7–10 GB (model loaded twice, two copies per load) | 0–100 MB |
+> | Time, layers + depth + PSD | — | ~8 min |
+> | GPU memory used / held during a layer pass | — | ~9.5 GB / ~14.8 GB |
+>
+> Upstream's defaults are 1280 px layers and 768 px depth. On 24 GB, 640 px is verified; higher resolutions are
+> being measured. MPS still holds ~5 GB beyond what PyTorch uses (outside PyTorch's control), which is the current limit.
+
 
 See-through: Single-image Layer Decomposition for Anime Characters
 ---
