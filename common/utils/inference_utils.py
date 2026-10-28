@@ -241,6 +241,11 @@ def apply_layerdiff(
             head_img = np.array(Image.open(osp.join(saved, 'head.png')))
 
         head_tag_list = HEAD_TAGS_V3
+        # the head pass starts from the seed too, so it gives the same layers whether it runs after the body
+        # pass in this process or on its own in a fresh one: reset both the pipeline's generator and the
+        # global RNG (the scheduler draws its step noise from the global one)
+        seed_everything(seed)
+        rng = torch.Generator(device=pipeline.unet.device).manual_seed(seed)
         hx0, hy0, hw, hh = cv2.boundingRect(cv2.findNonZero((head_img[..., -1] > 15).astype(np.uint8)))
         
         hx = int(hx0 * scale) - pad_pos[0]
