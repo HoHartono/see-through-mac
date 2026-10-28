@@ -1,10 +1,10 @@
-> ## 🍎 See-through for Apple Silicon Macs (`mac` branch)
+> ## 🍎 See-through for Apple Silicon Macs
 >
 > This fork of [shitagaki-lab/see-through](https://github.com/shitagaki-lab/see-through) runs See-through on
 > Apple Silicon Macs (PyTorch MPS) within 24 GB of unified memory, without writing GBs of swap to the SSD.
 > **The output is unchanged:** a full run at 640 px matches the output from before these memory changes (the
 > first Mac commit, running each pass in its own process) pixel for pixel in all 50 layer and depth files.
-> `main` mirrors upstream; the Mac changes are commits on [`mac`](https://github.com/HoHartono/see-through-mac/tree/mac).
+> The Mac changes are commits on top of upstream's `df019de`; upstream updates are merged in from the original repo.
 > All credit for the method and models goes to the original authors (paper and README below).
 >
 > ### What changed (Mac only, NVIDIA/CUDA runs as before)
