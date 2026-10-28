@@ -8,6 +8,12 @@ default_n_threads = 8
 os.environ['OPENBLAS_NUM_THREADS'] = f"{default_n_threads}"
 os.environ['MKL_NUM_THREADS'] = f"{default_n_threads}"
 os.environ['OMP_NUM_THREADS'] = f"{default_n_threads}"
+if sys.platform == 'darwin':
+    # MPS only tidies its cached memory above 1.4x the GPU's recommended working set, which is more than a 24 GB
+    # Mac has, so the pool kept growing (16.6 GB held for 9.5 GB used at 640 px). 0.6 starts tidying earlier.
+    # This is the soft limit; the hard one (HIGH_WATERMARK, which raises out-of-memory errors) is untouched.
+    # Must be set before torch starts.
+    os.environ.setdefault('PYTORCH_MPS_LOW_WATERMARK_RATIO', '0.6')
 
 import numpy as np
 import torch
