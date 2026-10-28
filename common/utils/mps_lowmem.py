@@ -134,8 +134,8 @@ def load_to_device(cls, pretrained, subfolder=None, device="mps", dtype=torch.bf
     for name, tensor in read_safetensors_nocache(os.path.join(folder, "diffusion_pytorch_model.safetensors")):
         if name not in expected:
             raise RuntimeError(f"{cls.__name__}: unexpected weight {name}")
-        # synchronous copy: the CPU buffer is freed right after
-        set_module_tensor_to_device(model, name, device, value=tensor.to(device, dtype))
+        # dtype must be passed: without it accelerate casts to the empty model's float32 (double memory)
+        set_module_tensor_to_device(model, name, device, value=tensor.to(device, dtype), dtype=dtype)
         seen.add(name)
     if seen != expected:
         raise RuntimeError(f"{cls.__name__}: missing weights {sorted(expected - seen)[:5]}")
@@ -210,7 +210,7 @@ def swap_used_mb():
     return float(re.search(r"used = ([\d.]+)M", out).group(1))
 
 
-def start_swap_guard(limit_mb=300, interval_s=2):
+def start_swap_guard(limit_mb=1500, interval_s=2):
     """stop the process when the swap files grow by more than limit_mb (SSD writes); 0 turns it off"""
     if not limit_mb:
         return

@@ -37,7 +37,7 @@ if __name__ == '__main__':
     parser.add_argument('--tblr_split', action='store_true', help='try split parts (handwear, eyes, etc) into left-right components')
     parser.add_argument('--disable_progressbar', action='store_true', help='hide progressbar')
     parser.add_argument('--group_offload', action='store_true')
-    parser.add_argument('--swap_limit_mb', type=int, default=300, help="Mac: stop if swap grows by more than this (0: off)")
+    parser.add_argument('--swap_limit_mb', type=int, default=1500, help="Mac: stop if swap grows by more than this (0: off); a few hundred MB while loading is normal macOS behaviour")
     args = parser.parse_args()
     srcp = args.srcp
 
