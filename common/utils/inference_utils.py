@@ -1,6 +1,7 @@
 import os
 import os.path as osp
 import gc
+import json
 
 from modules.layerdiffuse.diffusers_kdiffusion_sdxl import KDiffusionStableDiffusionXLPipeline, UNetFrameConditionModel
 from modules.layerdiffuse.vae import TransparentVAE
@@ -38,9 +39,46 @@ HEAD_TAGS_V3 = ['headwear', 'face', 'irides', 'eyebrow', 'eyewhite', 'eyelash', 
 # 'both' (original behaviour), 'body' (body layers only) or 'head' (head layers from a saved head.png)
 LAYERDIFF_STAGE = 'both'
 
-def _weights_gb(pretrained):
+def _weights_gb(pretrained, skip=()):
     return sum(os.path.getsize(osp.join(d, f)) for d, _, fs in os.walk(pretrained)
-               for f in fs if f.endswith('.safetensors')) / 1e9
+               if osp.basename(d) not in skip for f in fs if f.endswith('.safetensors')) / 1e9
+
+
+# working memory on top of the weights while a pass runs; a first estimate, the test runs measure it per resolution
+WORK_MARGIN_GB = 3
+
+
+def _saved_tag_embeds(pretrained, unet_dir):
+    """The v3 prompts are always the same 13 body + 11 head tags, so their CLIP embeddings are computed once,
+    saved next to the model, and the two text encoders (1.6 GB) are never loaded again.
+    Same batches and code as KDiffusionStableDiffusionXLPipeline.cache_tag_embeds, so the values are identical."""
+    from types import SimpleNamespace
+    from safetensors.torch import save_file
+    from transformers import CLIPTokenizer
+
+    with open(osp.join(unet_dir, 'config.json')) as f:
+        if json.load(f).get('tag_version') != 'v3':
+            return None
+    path = osp.join(pretrained, 'tag_embeds_v3.safetensors')
+    if not osp.exists(path):
+        print('computing the tag embeddings once (text encoders load only this time)', flush=True)
+        enc = SimpleNamespace(unet=SimpleNamespace(dtype=torch.bfloat16))
+        for name, cls in (('text_encoder', CLIPTextModel), ('text_encoder_2', CLIPTextModelWithProjection)):
+            setattr(enc, name, cls.from_pretrained(pretrained, subfolder=name, dtype=torch.bfloat16, device_map=DEVICE))
+        enc.tokenizer = CLIPTokenizer.from_pretrained(pretrained, subfolder='tokenizer')
+        enc.tokenizer_2 = CLIPTokenizer.from_pretrained(pretrained, subfolder='tokenizer_2')
+        tensors = {}
+        for tags in (BODY_TAGS_V3, HEAD_TAGS_V3):
+            embeds, pooled = KDiffusionStableDiffusionXLPipeline.encode_cropped_prompt_77tokens(enc, tags)
+            for i, tag in enumerate(tags):
+                tensors[f'{tag}/embeds'] = embeds[[i]].cpu().contiguous()
+                tensors[f'{tag}/pooled'] = pooled[[i]].cpu().contiguous()
+        save_file(tensors, path)
+        del enc, embeds, pooled
+        gc.collect()
+        torch.mps.empty_cache()
+    saved = load_file(path)
+    return {tag: [saved[f'{tag}/embeds'], saved[f'{tag}/pooled']] for tag in BODY_TAGS_V3 + HEAD_TAGS_V3}
 
 
 layerdiff_pipeline: KDiffusionStableDiffusionXLPipeline = None
@@ -50,17 +88,23 @@ def apply_layerdiff(
     
     global layerdiff_pipeline
     if layerdiff_pipeline is None:
+        tag_embeds = None
         if DEVICE == 'mps':
-            wait_for_free_ram(_weights_gb(pretrained) + 4)
+            tag_embeds = _saved_tag_embeds(pretrained, unet_ckpt or osp.join(pretrained, 'unet'))
+            skip = ('text_encoder', 'text_encoder_2') if tag_embeds else ()
+            wait_for_free_ram(_weights_gb(pretrained, skip) + WORK_MARGIN_GB, 'LayerDiff')
         load_phase = MemPhase('load layerdiff').__enter__()
         # load straight into bf16: fp32 loading doubles peak memory, which swaps on a 24GB Mac
         trans_vae = TransparentVAE.from_pretrained(pretrained, subfolder='trans_vae', torch_dtype=torch.bfloat16)
         extra = {}
         if DEVICE == 'mps':
-            # stream the big parts straight to the GPU: RAM + GPU copies would share the same unified memory
+            # the UNet goes straight to the GPU: a RAM copy would share the same unified memory
             unet = load_to_device(UNetFrameConditionModel, unet_ckpt or pretrained, None if unet_ckpt else 'unet')
-            for name, cls in (('text_encoder', CLIPTextModel), ('text_encoder_2', CLIPTextModelWithProjection)):
-                extra[name] = cls.from_pretrained(pretrained, subfolder=name, dtype=torch.bfloat16, device_map=DEVICE)
+            if tag_embeds is not None:
+                extra = dict(text_encoder=None, text_encoder_2=None)
+            else:
+                for name, cls in (('text_encoder', CLIPTextModel), ('text_encoder_2', CLIPTextModelWithProjection)):
+                    extra[name] = cls.from_pretrained(pretrained, subfolder=name, dtype=torch.bfloat16, device_map=DEVICE)
         elif unet_ckpt is None:
             unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet', torch_dtype=torch.bfloat16)
         else:
@@ -71,6 +115,10 @@ def apply_layerdiff(
             trans_vae=trans_vae, unet=unet,
             scheduler=None, torch_dtype=torch.bfloat16, **extra
         )
+        if tag_embeds is not None:
+            # what cache_tag_embeds leaves behind, without ever loading the encoders
+            layerdiff_pipeline.text_encoder = layerdiff_pipeline.text_encoder_2 = torch.nn.Identity()
+            layerdiff_pipeline._cached_prompt_embeds = tag_embeds
 
         if vae_ckpt is not None:
             td_sd = {}
@@ -232,7 +280,7 @@ def apply_marigold(srcp, pretrained: str, num_inference_steps=-1, seed=0, save_d
     global marigold_pipeline
     if marigold_pipeline is None:
         if DEVICE == 'mps':
-            wait_for_free_ram(_weights_gb(pretrained) + 4)
+            wait_for_free_ram(_weights_gb(pretrained) + WORK_MARGIN_GB, 'Marigold')
         with MemPhase('load marigold'):
             if DEVICE == 'mps':
                 unet = load_to_device(UNetFrameConditionModel, pretrained, 'unet')
