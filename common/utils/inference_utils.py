@@ -12,7 +12,7 @@ from utils.torch_utils import seed_everything
 from utils.io_utils import json2dict, dict2json, load_parts, save_tmp_img, load_part, save_psd
 from utils.torchcv import cluster_inpaint_part
 from utils import mps_lowmem
-from utils.mps_lowmem import MemPhase, load_to_device, wait_for_free_ram
+from utils.mps_lowmem import MemPhase, load_to_device, make_room, wait_for_free_ram
 
 from psd_tools import PSDImage
 from transformers import CLIPTextModel, CLIPTextModelWithProjection
@@ -102,7 +102,9 @@ def apply_layerdiff(
         if DEVICE == 'mps':
             tag_embeds = _saved_tag_embeds(pretrained, unet_ckpt or osp.join(pretrained, 'unet'))
             skip = ('text_encoder', 'text_encoder_2') if tag_embeds else ()
-            wait_for_free_ram(_weights_gb(pretrained, skip) + WORK_MARGIN_GB, 'LayerDiff')
+            need = _weights_gb(pretrained, skip) + WORK_MARGIN_GB
+            wait_for_free_ram(need, 'LayerDiff')
+            make_room(need)
         load_phase = MemPhase('load layerdiff').__enter__()
         # load straight into bf16: fp32 loading doubles peak memory, which swaps on a 24GB Mac
         trans_vae = TransparentVAE.from_pretrained(pretrained, subfolder='trans_vae', torch_dtype=torch.bfloat16)
@@ -292,7 +294,9 @@ def apply_marigold(srcp, pretrained: str, num_inference_steps=-1, seed=0, save_d
         pretrained = _local_model(pretrained)
     if marigold_pipeline is None:
         if DEVICE == 'mps':
-            wait_for_free_ram(_weights_gb(pretrained) + WORK_MARGIN_GB, 'Marigold')
+            need = _weights_gb(pretrained) + WORK_MARGIN_GB
+            wait_for_free_ram(need, 'Marigold')
+            make_room(need)
         with MemPhase('load marigold'):
             if DEVICE == 'mps':
                 unet = load_to_device(UNetFrameConditionModel, pretrained, 'unet')

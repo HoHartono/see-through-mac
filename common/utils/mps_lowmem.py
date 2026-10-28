@@ -11,6 +11,7 @@ All changes keep the maths identical, they only work in smaller pieces:
 - free memory: psutil's "available" is free + inactive, and inactive includes other apps' idle memory that
   macOS can only reclaim by swapping it out. free_gb() counts free pages plus file cache macOS can drop
 - wait_for_free_ram: wait before loading until the weights fit in free memory, and say what is short
+- make_room: turn droppable file cache into free pages slowly, so the fast load doesn't make macOS swap
 - start_swap_guard: stops the run if swap grows past a limit, so a run can't keep writing to the SSD
 - MemPhase: prints the lowest free memory and how much swap grew during a phase, to see what needs memory
 
@@ -146,15 +147,47 @@ def load_to_device(cls, pretrained, subfolder=None, device="mps", dtype=torch.bf
 CACHE_FLOOR_GB = 5.5
 
 
+def _vm_gb():
+    out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+    page = int(re.search(r"page size of (\d+)", out).group(1))
+    return {m.group(1): int(m.group(2)) * page / 1e9 for m in re.finditer(r'^"?([^":]+)"?:\s+(\d+)\.', out, re.M)}
+
+
+def pages_free_gb():
+    """free right now, with nothing to drop first"""
+    v = _vm_gb()
+    return v["Pages free"] + v["Pages speculative"] + v["Pages purgeable"]
+
+
 def free_gb():
     """memory macOS hands out without swapping: free + speculative + purgeable pages, plus the file cache
     above CACHE_FLOOR_GB (clean copies of files; dropping them writes nothing). psutil's "available" also
     counts other apps' inactive memory, which can only be freed by swapping it out."""
-    out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
-    page = int(re.search(r"page size of (\d+)", out).group(1))
-    v = {m.group(1): int(m.group(2)) * page / 1e9 for m in re.finditer(r'^"?([^":]+)"?:\s+(\d+)\.', out, re.M)}
+    v = _vm_gb()
     free = v["Pages free"] + v["Pages speculative"] + v["Pages purgeable"]
     return free + max(0.0, v["File-backed pages"] - CACHE_FLOOR_GB)
+
+
+def make_room(need_gb, step_gb=0.5, pause_s=0.15, max_swap_mb=50):
+    """Turn droppable file cache into free pages before a fast load.
+    Loading reads at several GB/s; when that has to come out of the file cache, macOS can't drop the cache
+    fast enough and swaps a little instead (251 MB in a 640 px test). Taking the memory in 512 MB steps
+    first gave 12.5 GB with zero swap, and releasing it left it all free for the load."""
+    if pages_free_gb() >= need_gb:
+        return
+    t0, swap0, held = time.time(), swap_used_mb(), []
+    try:
+        while len(held) * step_gb + pages_free_gb() < need_gb:
+            if swap_used_mb() - swap0 > max_swap_mb:
+                print("[mem] make room: macOS started swapping, stopping early", flush=True)
+                break
+            held.append(torch.ones(int(step_gb * 2**30) // 2, dtype=torch.bfloat16, device="mps"))
+            torch.mps.synchronize()
+            time.sleep(pause_s)
+    finally:
+        del held
+        torch.mps.empty_cache()
+    print(f"[mem] make room: {pages_free_gb():.1f} GB free for loading ({time.time() - t0:.0f}s)", flush=True)
 
 
 def wait_for_free_ram(need_gb, what, timeout_s=300):
