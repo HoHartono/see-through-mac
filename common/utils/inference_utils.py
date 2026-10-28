@@ -39,6 +39,14 @@ HEAD_TAGS_V3 = ['headwear', 'face', 'irides', 'eyebrow', 'eyewhite', 'eyelash', 
 # 'both' (original behaviour), 'body' (body layers only) or 'head' (head layers from a saved head.png)
 LAYERDIFF_STAGE = 'both'
 
+def _local_model(pretrained):
+    """a Hugging Face repo id becomes its local snapshot folder; local folders pass through"""
+    if osp.isdir(pretrained):
+        return pretrained
+    from huggingface_hub import snapshot_download
+    return snapshot_download(pretrained)
+
+
 def _weights_gb(pretrained, skip=()):
     return sum(os.path.getsize(osp.join(d, f)) for d, _, fs in os.walk(pretrained)
                if osp.basename(d) not in skip for f in fs if f.endswith('.safetensors')) / 1e9
@@ -87,6 +95,8 @@ def apply_layerdiff(
     resolution=1280, vae_ckpt=None, unet_ckpt=None, disable_progressbar=False, cache_tag_embeds=True, group_offload=False):
     
     global layerdiff_pipeline
+    if DEVICE == 'mps':
+        pretrained = _local_model(pretrained)
     if layerdiff_pipeline is None:
         tag_embeds = None
         if DEVICE == 'mps':
@@ -278,6 +288,8 @@ marigold_pipeline: MarigoldDepthPipeline = None
 def apply_marigold(srcp, pretrained: str, num_inference_steps=-1, seed=0, save_dir='workspace/layerdiff_output', target_tag_list=VALID_BODY_PARTS_V2, \
     resolution=768, normalize_depth=False, disable_progressbar=False, cache_tag_embeds=True, group_offload=False):
     global marigold_pipeline
+    if DEVICE == 'mps':
+        pretrained = _local_model(pretrained)
     if marigold_pipeline is None:
         if DEVICE == 'mps':
             wait_for_free_ram(_weights_gb(pretrained) + WORK_MARGIN_GB, 'Marigold')

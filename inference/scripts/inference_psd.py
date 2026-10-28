@@ -1,5 +1,6 @@
 import os.path as osp
 import argparse
+import gc
 import sys
 import os
 
@@ -14,7 +15,8 @@ from tqdm import tqdm
 
 from utils.io_utils import find_all_imgs
 from utils import inference_utils
-from utils.inference_utils import apply_layerdiff, apply_marigold, further_extr
+from utils.inference_utils import apply_layerdiff, apply_marigold, further_extr, DEVICE
+from utils.mps_lowmem import start_swap_guard
 from utils.torch_utils import seed_everything
 
 if __name__ == '__main__':
@@ -35,6 +37,7 @@ if __name__ == '__main__':
     parser.add_argument('--tblr_split', action='store_true', help='try split parts (handwear, eyes, etc) into left-right components')
     parser.add_argument('--disable_progressbar', action='store_true', help='hide progressbar')
     parser.add_argument('--group_offload', action='store_true')
+    parser.add_argument('--swap_limit_mb', type=int, default=300, help="Mac: stop if swap grows by more than this (0: off)")
     args = parser.parse_args()
     srcp = args.srcp
 
@@ -42,6 +45,9 @@ if __name__ == '__main__':
         imglist = find_all_imgs(srcp, abs_path=True)
     else:
         imglist = [srcp]
+
+    if DEVICE == 'mps':
+        start_swap_guard(args.swap_limit_mb)
 
     for srcp in tqdm(imglist):
 
@@ -51,10 +57,20 @@ if __name__ == '__main__':
         apply_layerdiff(srcp, args.repo_id_layerdiff, save_dir=args.save_dir, seed=args.seed, vae_ckpt=args.vae_ckpt, unet_ckpt=args.unet_ckpt, \
             resolution=args.resolution, disable_progressbar=args.disable_progressbar, num_inference_steps=args.inference_steps, group_offload=args.group_offload)
 
+        if DEVICE == 'mps':
+            # body and head shared one LayerDiff load; free it so the depth model never sits next to it
+            inference_utils.layerdiff_pipeline = None
+            gc.collect()
+            torch.mps.empty_cache()
+
         print('running marigold...')
         apply_marigold(srcp, args.repo_id_depth, save_dir=args.save_dir, seed=args.seed, disable_progressbar=args.disable_progressbar, \
             resolution=args.resolution_depth, num_inference_steps=args.inference_steps_depth, group_offload=args.group_offload)
 
         srcname = osp.basename(osp.splitext(srcp)[0])
         saved = osp.join(args.save_dir, srcname)
+        if DEVICE == 'mps':
+            inference_utils.marigold_pipeline = None
+            gc.collect()
+            torch.mps.empty_cache()
         further_extr(saved, rotate=False, save_to_psd=args.save_to_psd, tblr_split=args.tblr_split)

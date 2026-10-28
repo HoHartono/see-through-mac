@@ -9,8 +9,9 @@ All changes keep the maths identical, they only work in smaller pieces:
   copies share the same RAM (~15 GB peak for the 10 GB LayerDiff). load_to_device reads one tensor at a time
   with F_NOCACHE, so neither a RAM copy nor macOS's file cache of the 8 GB file builds up
 - free memory: psutil's "available" is free + inactive, and inactive includes other apps' idle memory that
-  macOS can only reclaim by swapping it out. free_gb() counts only pages that are free right now
+  macOS can only reclaim by swapping it out. free_gb() counts free pages plus file cache macOS can drop
 - wait_for_free_ram: wait before loading until the weights fit in free memory, and say what is short
+- start_swap_guard: stops the run if swap grows past a limit, so a run can't keep writing to the SSD
 - MemPhase: prints the lowest free memory and how much swap grew during a phase, to see what needs memory
 
 Set ST_LOWMEM=0 to turn the chunking off (for comparing outputs), ST_CHUNK_MB to change the piece size.
@@ -140,12 +141,20 @@ def load_to_device(cls, pretrained, subfolder=None, device="mps", dtype=torch.bf
     return model.to(device).eval()   # moves the few buffers created outside the weights file
 
 
+# file cache macOS keeps for files in use (app code etc.); measured: it dropped the cache down to ~5.2 GB
+# without swapping, then started compressing app memory
+CACHE_FLOOR_GB = 5.5
+
+
 def free_gb():
-    """memory macOS can hand out without evicting anything: free + speculative + purgeable pages"""
+    """memory macOS hands out without swapping: free + speculative + purgeable pages, plus the file cache
+    above CACHE_FLOOR_GB (clean copies of files; dropping them writes nothing). psutil's "available" also
+    counts other apps' inactive memory, which can only be freed by swapping it out."""
     out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
     page = int(re.search(r"page size of (\d+)", out).group(1))
-    pages = {m.group(1): int(m.group(2)) for m in re.finditer(r"^Pages (free|speculative|purgeable):\s+(\d+)\.", out, re.M)}
-    return sum(pages.values()) * page / 1e9
+    v = {m.group(1): int(m.group(2)) * page / 1e9 for m in re.finditer(r'^"?([^":]+)"?:\s+(\d+)\.', out, re.M)}
+    free = v["Pages free"] + v["Pages speculative"] + v["Pages purgeable"]
+    return free + max(0.0, v["File-backed pages"] - CACHE_FLOOR_GB)
 
 
 def wait_for_free_ram(need_gb, what, timeout_s=300):
@@ -166,6 +175,22 @@ def swap_used_mb():
     """MB in the swap files now. vm_stat's Swapouts counter overstates what reaches the SSD."""
     out = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True).stdout
     return float(re.search(r"used = ([\d.]+)M", out).group(1))
+
+
+def start_swap_guard(limit_mb=300, interval_s=2):
+    """stop the process when the swap files grow by more than limit_mb (SSD writes); 0 turns it off"""
+    if not limit_mb:
+        return
+    start = swap_used_mb()
+
+    def watch():
+        while True:
+            time.sleep(interval_s)
+            grew = swap_used_mb() - start
+            if grew > limit_mb:
+                print(f"[swap-guard] STOPPED: swap grew {grew:.0f} MB. Close apps, or lower --resolution.", flush=True)
+                os._exit(3)
+    threading.Thread(target=watch, daemon=True).start()
 
 
 class MemPhase:
