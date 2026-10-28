@@ -5,11 +5,14 @@ All changes keep the maths identical, they only work in smaller pieces:
   over batch and heads (bit-identical), or over queries for one huge head (softmax is per query row)
 - GroupNorm: MPS runs it in fp32; split over batch, or over channels at group boundaries
 - feed-forward: GEGLU widens every token 8x; tokens are independent, so run them in slices
-- MemPhase: prints the lowest free RAM and the swap written during a phase, to see what needs memory
+- loading: from_pretrained reads all weights into RAM, then .to('mps') copies them; on unified memory both
+  copies share the same RAM (~15 GB peak for the 10 GB LayerDiff). load_to_device streams one tensor at a time
+- wait_for_free_ram: the previous stage's process gives its memory back gradually; wait before loading
+- MemPhase: prints the lowest free RAM and how much swap grew during a phase, to see what needs memory
 
 Set ST_LOWMEM=0 to turn the chunking off (for comparing outputs), ST_CHUNK_MB to change the piece size.
 """
-import os, subprocess, threading
+import os, re, subprocess, threading, time
 
 import psutil
 import torch
@@ -90,16 +93,45 @@ def install():
     _installed = True
 
 
-def swapouts_mb():
-    out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
-    for line in out.splitlines():
-        if line.startswith("Swapouts"):
-            return int(line.split(":")[1].strip().rstrip(".")) * 16384 / 1e6
-    return 0.0
+def load_to_device(cls, pretrained, subfolder=None, device="mps", dtype=torch.bfloat16):
+    """cls.from_pretrained(...).to(device, dtype), but never holding a second full copy of the weights"""
+    from accelerate import init_empty_weights
+    from accelerate.utils import set_module_tensor_to_device
+    from safetensors import safe_open
+
+    folder = os.path.join(pretrained, subfolder) if subfolder else pretrained
+    with init_empty_weights(include_buffers=False):
+        model = cls.from_config(cls.load_config(folder))
+    expected = set(model.state_dict().keys())
+    with safe_open(os.path.join(folder, "diffusion_pytorch_model.safetensors"), "pt", device="cpu") as f:
+        keys = set(f.keys())
+        if keys != expected:
+            raise RuntimeError(f"{cls.__name__} weights don't match the model: "
+                               f"missing {sorted(expected - keys)[:5]}, unexpected {sorted(keys - expected)[:5]}")
+        for k in f.keys():
+            set_module_tensor_to_device(model, k, device, value=f.get_tensor(k), dtype=dtype)
+    return model.to(device).eval()   # moves the few buffers created outside the weights file
+
+
+def wait_for_free_ram(need_gb, timeout_s=180):
+    """wait until need_gb is free; after timeout_s carry on anyway (the SSD guard still watches)"""
+    t0 = time.time()
+    while (free := psutil.virtual_memory().available / 1e9) < need_gb:
+        if time.time() - t0 > timeout_s:
+            print(f"[mem] only {free:.1f} GB free after {timeout_s}s (want {need_gb:.0f}); continuing", flush=True)
+            return
+        print(f"[mem] waiting for RAM: {free:.1f} GB free, want {need_gb:.0f} GB", flush=True)
+        time.sleep(5)
+
+
+def swap_used_mb():
+    """MB in the swap files now. vm_stat's Swapouts counter overstates what reaches the SSD."""
+    out = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True).stdout
+    return float(re.search(r"used = ([\d.]+)M", out).group(1))
 
 
 class MemPhase:
-    """with MemPhase('load unet'): ...  -> [mem] load unet: lowest free RAM 9.1 GB, swap written 0 MB"""
+    """with MemPhase('load unet'): ...  -> [mem] load unet: lowest free RAM 9.1 GB, swap grew 0 MB, disk writes 12 MB"""
 
     def __init__(self, label, interval=0.5):
         self.label, self.interval = label, interval
@@ -108,14 +140,18 @@ class MemPhase:
     def _run(self):
         while not self._stop.wait(self.interval):
             self.low = min(self.low, psutil.virtual_memory().available)
+            self.swap_peak = max(self.swap_peak, swap_used_mb())
 
     def __enter__(self):
-        self.swap0, self.low = swapouts_mb(), psutil.virtual_memory().available
+        self.swap0 = self.swap_peak = swap_used_mb()
+        self.low, self.w0 = psutil.virtual_memory().available, psutil.disk_io_counters().write_bytes
         threading.Thread(target=self._run, daemon=True).start()
         return self
 
     def __exit__(self, *exc):
         self._stop.set()
         self.low = min(self.low, psutil.virtual_memory().available)
+        self.swap_peak = max(self.swap_peak, swap_used_mb())
         print(f"[mem] {self.label}: lowest free RAM {self.low / 1e9:.1f} GB, "
-              f"swap written {swapouts_mb() - self.swap0:.0f} MB", flush=True)
+              f"swap grew {max(0, self.swap_peak - self.swap0):.0f} MB, "
+              f"disk writes {(psutil.disk_io_counters().write_bytes - self.w0) / 1e6:.0f} MB", flush=True)

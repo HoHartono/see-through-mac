@@ -11,9 +11,10 @@ from utils.torch_utils import seed_everything
 from utils.io_utils import json2dict, dict2json, load_parts, save_tmp_img, load_part, save_psd
 from utils.torchcv import cluster_inpaint_part
 from utils import mps_lowmem
-from utils.mps_lowmem import MemPhase
+from utils.mps_lowmem import MemPhase, load_to_device, wait_for_free_ram
 
 from psd_tools import PSDImage
+from transformers import CLIPTextModel, CLIPTextModelWithProjection
 from safetensors.torch import load_file
 import cv2
 import numpy as np
@@ -37,6 +38,11 @@ HEAD_TAGS_V3 = ['headwear', 'face', 'irides', 'eyebrow', 'eyewhite', 'eyelash', 
 # 'both' (original behaviour), 'body' (body layers only) or 'head' (head layers from a saved head.png)
 LAYERDIFF_STAGE = 'both'
 
+def _weights_gb(pretrained):
+    return sum(os.path.getsize(osp.join(d, f)) for d, _, fs in os.walk(pretrained)
+               for f in fs if f.endswith('.safetensors')) / 1e9
+
+
 layerdiff_pipeline: KDiffusionStableDiffusionXLPipeline = None
 def apply_layerdiff(
     imgp: str, pretrained: str, num_inference_steps=30, seed=0, save_dir='workspace/layerdiff_output', target_tag_list=VALID_BODY_PARTS_V2, 
@@ -44,10 +50,18 @@ def apply_layerdiff(
     
     global layerdiff_pipeline
     if layerdiff_pipeline is None:
+        if DEVICE == 'mps':
+            wait_for_free_ram(_weights_gb(pretrained) + 4)
         load_phase = MemPhase('load layerdiff').__enter__()
         # load straight into bf16: fp32 loading doubles peak memory, which swaps on a 24GB Mac
         trans_vae = TransparentVAE.from_pretrained(pretrained, subfolder='trans_vae', torch_dtype=torch.bfloat16)
-        if unet_ckpt is None:
+        extra = {}
+        if DEVICE == 'mps':
+            # stream the big parts straight to the GPU: RAM + GPU copies would share the same unified memory
+            unet = load_to_device(UNetFrameConditionModel, unet_ckpt or pretrained, None if unet_ckpt else 'unet')
+            for name, cls in (('text_encoder', CLIPTextModel), ('text_encoder_2', CLIPTextModelWithProjection)):
+                extra[name] = cls.from_pretrained(pretrained, subfolder=name, dtype=torch.bfloat16, device_map=DEVICE)
+        elif unet_ckpt is None:
             unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet', torch_dtype=torch.bfloat16)
         else:
             print(f'load unet from {unet_ckpt}')
@@ -55,7 +69,7 @@ def apply_layerdiff(
         layerdiff_pipeline = KDiffusionStableDiffusionXLPipeline.from_pretrained(
             pretrained,
             trans_vae=trans_vae, unet=unet,
-            scheduler=None, torch_dtype=torch.bfloat16
+            scheduler=None, torch_dtype=torch.bfloat16, **extra
         )
 
         if vae_ckpt is not None:
@@ -217,8 +231,13 @@ def apply_marigold(srcp, pretrained: str, num_inference_steps=-1, seed=0, save_d
     resolution=768, normalize_depth=False, disable_progressbar=False, cache_tag_embeds=True, group_offload=False):
     global marigold_pipeline
     if marigold_pipeline is None:
+        if DEVICE == 'mps':
+            wait_for_free_ram(_weights_gb(pretrained) + 4)
         with MemPhase('load marigold'):
-            unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet', torch_dtype=torch.bfloat16)
+            if DEVICE == 'mps':
+                unet = load_to_device(UNetFrameConditionModel, pretrained, 'unet')
+            else:
+                unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet', torch_dtype=torch.bfloat16)
             marigold_pipeline = MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet, torch_dtype=torch.bfloat16)
             marigold_pipeline.to(device=DEVICE, dtype=torch.bfloat16)
 
